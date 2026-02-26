@@ -1,0 +1,26 @@
+# Environments
+venv/
+env/
+.env
+
+# Python compilation files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Application specific cache and storage
+rag_storage/
+temp_uploads/
+
+# Model binaries (Add specific models here to prevent them from being uploaded)
+*.bin
+*.gguf
+mistral-7b-instruct-v0.2.Q4_K_M-GGUF/
+
+# Testing files
+verify_output.txt
+test_rag/
+rag_test_data/
+demo_documents/
+text_files/
