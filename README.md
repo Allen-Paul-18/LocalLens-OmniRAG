@@ -11,8 +11,8 @@ This is a comprehensive offline-capable Retrieval-Augmented Generation (RAG) sys
 ## Installation Steps
 1. **Clone the repository:**
    ```bash
-   git clone <repository_url>
-   cd <repository_directory>
+   git clone https://github.com/Allen-Paul-18/LocalLens-OmniRAG.git
+   cd LocalLens-OmniRAG
    ```
 
 2. **Set up a Python virtual environment (recommended):**
