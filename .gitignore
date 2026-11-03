@@ -1,26 +1,88 @@
-# Environments
+# ==============================
+# Environments and secrets
+# ==============================
 venv/
 env/
+.venv/
 .env
+.env.*
+!.env.example
 
+# ==============================
 # Python compilation files
+# ==============================
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.pyd
+*$py.class
 
-# Application specific cache and storage
+# ==============================
+# IDE and editor files
+# ==============================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ==============================
+# Application cache and storage
+# ==============================
 rag_storage/
 temp_uploads/
+.cache/
+.pytest_cache/
+.streamlit/secrets.toml
 
-# Model binaries (Add specific models here to prevent them from being uploaded)
+# ==============================
+# Model binaries and weights
+# ==============================
 *.bin
 *.gguf
-mistral-7b-instruct-v0.2.Q4_K_M-GGUF/
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.h5
+*.model
 
-# Testing files
+# Model directories
+mistral_model/
+audio_model/
+
+# ==============================
+# Databases and generated data
+# ==============================
+*.sqlite
+*.sqlite3
+*.db
+open_pdbs.sql
+
+# ==============================
+# Testing and demo files
+# ==============================
 verify_output.txt
 test_rag/
 rag_test_data/
 demo_documents/
 text_files/
+
+# ==============================
+# Temporary scripts
+# ==============================
+cuda_check.py
+examples.py
+llama_load_check.py
+pytorch_check.py
+
+# ==============================
+# Logs
+# ==============================
+*.log
+logs/
+
+# ==============================
+# OS-generated files
+# ==============================
+.DS_Store
+Thumbs.db
+desktop.ini

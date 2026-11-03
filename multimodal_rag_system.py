@@ -35,12 +35,9 @@ except Exception:
 import torch
 from transformers import CLIPProcessor, CLIPModel
 
-# Vector database - Oracle 23ai (python-oracledb, thin mode)
-import oracledb
-# Crucial: Fetch CLOBs as strings directly to avoid LOB locator issues
-oracledb.defaults.fetch_lobs = False
+# Local vector database
+import chromadb
 
-import array as _array
 import json as _json
 
 # LLM for generation (can use local models)
@@ -74,9 +71,10 @@ class MultimodalRAGSystem:
                  use_gpu: bool = True,
                  embedding_strategy: str = "minilm",
                  llm_path: str = None,
-                 oracle_dsn: str = None,
-                 oracle_user: str = None,
-                 oracle_password: str = None):
+                 llm_backend: str = "local",
+                 llm_n_gpu_layers: int = 0,
+                 llm_base_url: str = "http://localhost:1234/v1",
+                 llm_api_key: str = "lm-studio"):
         """
         Initialize the RAG system with local models
 
@@ -84,11 +82,11 @@ class MultimodalRAGSystem:
             storage_dir: Directory for storing vector database and cache
             use_gpu: Whether to use GPU acceleration if available
             embedding_strategy: Strategy for embeddings ('minilm', 'clip', etc.)
-            llm_path: Path to local GGUF model file
-            oracle_dsn: Oracle EZConnect / DSN string, e.g. 'localhost:1521/FREEPDB1'.
-                        Falls back to env var ORACLE_DSN.
-            oracle_user: Oracle username. Falls back to env var ORACLE_USER.
-            oracle_password: Oracle password. Falls back to env var ORACLE_PASSWORD.
+            llm_path: Path to local GGUF model file (llama-cpp backend)
+            llm_backend: "local" for llama-cpp or "external" for an OpenAI-compatible server
+            llm_n_gpu_layers: Number of GGUF layers to offload; 0=CPU, -1=all possible layers
+            llm_base_url: Base URL of the external LLM server, e.g. http://localhost:1234/v1
+            llm_api_key: API key for the external server (LM Studio accepts a placeholder)
         """
         self.storage_dir = Path(storage_dir)
         self.storage_dir.mkdir(parents=True, exist_ok=True)
@@ -97,24 +95,28 @@ class MultimodalRAGSystem:
         self.embedding_strategy = embedding_strategy.lower()
         print(f"Initializing on device: {self.device} (strategy={self.embedding_strategy})")
 
-        # Oracle connection parameters (env-var fallbacks)
-        self._oracle_dsn = oracle_dsn or os.environ.get("ORACLE_DSN", "localhost:1521/FREEPDB1")
-        self._oracle_user = oracle_user or os.environ.get("ORACLE_USER", "rag_user")
-        self._oracle_password = oracle_password or os.environ.get("ORACLE_PASSWORD", "")
-
         # Initialize embedding models
         print("Loading embedding models...")
         self._init_embedding_models()
 
-        # Initialize vector database (Oracle 23ai)
-        print("Setting up Oracle 23ai vector store...")
+        # Initialize vector database (ChromaDB)
+        print("Setting up local ChromaDB vector store...")
         self._init_vector_db()
         
-        # Initialize LLM for generation
+        # Initialize the selected LLM backend. Only one backend is active at a time.
+        self.llm_backend = (llm_backend or "local").strip().lower()
         self.llm_model = None
         self.llm_tokenizer = None
-        if llm_path:
-            self._init_llm(llm_path)
+        self.llm_client = None
+        self.llm_external_model = None
+
+        if self.llm_backend == "external":
+            self._init_external_llm(llm_base_url, llm_api_key)
+        elif self.llm_backend == "local":
+            if llm_path:
+                self._init_llm(llm_path, n_gpu_layers=llm_n_gpu_layers)
+        else:
+            raise ValueError("llm_backend must be either 'local' or 'external'")
         
         # Document cache
         self.documents = {}
@@ -197,84 +199,126 @@ class MultimodalRAGSystem:
         else:
             self.reranker = None
         
-    # Table name mapping – mirrors the old collection names
-    _ORACLE_TABLES = {
-        'text':  'rag_text',
-        'image': 'rag_image',
-        'audio': 'rag_audio',
+    # ChromaDB collections
+    _CHROMA_COLLECTIONS = {
+        "text": "rag_text",
+        "image": "rag_image",
+        "audio": "rag_audio",
     }
 
+
     def _init_vector_db(self):
-        """Connect to Oracle 23ai and create RAG tables if they don't exist."""
-        print(f"Connecting to Oracle at {self._oracle_dsn} as {self._oracle_user}")
-        self._oracle_pool = oracledb.create_pool(
-            user=self._oracle_user,
-            password=self._oracle_password,
-            dsn=self._oracle_dsn,
-            min=1, max=4, increment=1
+        """Initialize local persistent ChromaDB."""
+
+        db_path = self.storage_dir / "chroma"
+
+        print(f"Opening ChromaDB at: {db_path}")
+
+        self._chroma_client = chromadb.PersistentClient(
+            path=str(db_path)
         )
 
-        # DDL: one table per modality, embedding dimension fixed to self.embedding_dim
-        ddl_template = """
-            CREATE TABLE IF NOT EXISTS {table} (
-                id          VARCHAR2(64)   PRIMARY KEY,
-                source_file VARCHAR2(512),
-                content     CLOB,
-                metadata    CLOB,
-                embedding   VECTOR({dim}, FLOAT32)
-            )"""
+        self._collections = {}
 
-        # Index DDL: HNSW index for fast ANN similarity search
-        index_template = """
-            CREATE VECTOR INDEX IF NOT EXISTS {table}_idx 
-            ON {table} (embedding) 
-            ORGANIZATION INMEMORY NEIGHBOR GRAPH 
-            DISTANCE COSINE 
-            WITH TARGET ACCURACY 90
-        """
+        for modality, collection_name in self._CHROMA_COLLECTIONS.items():
 
-        with self._oracle_pool.acquire() as con:
-            for table in self._ORACLE_TABLES.values():
-                ddl = ddl_template.format(table=table, dim=self.embedding_dim)
-                idx_ddl = index_template.format(table=table)
-                try:
-                    cur = con.cursor()
-                    cur.execute(ddl)
-                    con.commit()
-                    print(f"  Table ready: {table}")
-                    
-                    try:
-                        cur.execute(idx_ddl)
-                        print(f"  Vector Index ready: {table}_idx")
-                    except Exception as e:
-                        print(f"  Warning creating index on {table}: {e}")
-                except Exception as e:
-                    # Table may already exist with a different syntax - log and continue
-                    print(f"  Warning creating {table}: {e}")
+            collection = self._chroma_client.get_or_create_collection(
+                name=collection_name,
+                metadata={
+                    "hnsw:space": "cosine"
+                }
+            )
+
+            self._collections[modality] = collection
+
+            print(
+                f"  Collection ready: "
+                f"{collection_name} "
+                f"({collection.count()} items)"
+            )
+
+
+    def _chroma_metadata(self, chunk: DocumentChunk):
+        """Convert chunk metadata into Chroma-compatible metadata."""
+
+        safe_metadata = self._sanitize_metadata(
+            chunk.metadata
+        )
+
+        return {
+            "source_file": str(chunk.source_file),
+            "modality": str(chunk.modality),
+            "metadata_json": json.dumps(safe_metadata),
+        }
+
+
+    def _result_from_chroma(
+        self,
+        modality,
+        item_id,
+        document,
+        metadata,
+        distance
+    ):
+        """Convert Chroma result to the existing application format."""
+
+        try:
+            meta = json.loads(
+                metadata.get("metadata_json", "{}")
+            )
+        except Exception:
+            meta = {}
+
+        return {
+            "id": item_id,
+            "content": document or "",
+            "metadata": meta,
+            "distance": float(distance),
+            "relevance": max(
+                0.0,
+                1.0 - float(distance)
+            ),
+            "modality": modality,
+        }
+
 
     def drop_database(self):
-        """Drop all Oracle vector tables to completely reset the external database."""
-        if getattr(self, '_oracle_pool', None) is None:
-            return
-            
-        with self._oracle_pool.acquire() as con:
-            cur = con.cursor()
-            for table in self._ORACLE_TABLES.values():
-                try:
-                    cur.execute(f"DROP TABLE {table} CASCADE CONSTRAINTS")
-                    print(f"Dropped table: {table}")
-                except Exception as e:
-                    print(f"Could not drop table {table}: {e}")
-            con.commit()
-            
-        # Reset internal states
+        """Delete all ChromaDB collections."""
+
+        for collection_name in self._CHROMA_COLLECTIONS.values():
+
+            try:
+                self._chroma_client.delete_collection(
+                    collection_name
+                )
+
+                print(
+                    f"Deleted collection: {collection_name}"
+                )
+
+            except Exception as e:
+
+                print(
+                    f"Could not delete collection "
+                    f"{collection_name}: {e}"
+                )
+
+        self._collections = {}
+
+        self._init_vector_db()
+
+        # Reset internal caches
+
         self.documents.clear()
+
         self.doc_count = 0
         self.doc_len_sum = 0
+
         self.df.clear()
         self.doc_len.clear()
         self.doc_terms.clear()
         self.doc_term_freqs.clear()
+
         self.file_emb_sum.clear()
         self.file_emb_count.clear()
         self.file_emb_mean.clear()
@@ -392,17 +436,18 @@ class MultimodalRAGSystem:
             'ocr_available': bool(ocr_text.strip())
         }
 
-        # Always keep an image chunk for visual search to work
-        img_chunk = DocumentChunk(
-            id=self._generate_doc_id(filepath, 0),
-            source_file=os.path.basename(filepath),
-            content=f"Image: {os.path.basename(filepath)}",
-            modality='image',
-            metadata=metadata
-        )
-        img_chunk.metadata['image_path'] = filepath
-        img_chunk.metadata['file_path'] = filepath
-        chunks.append(img_chunk)
+        # If strategy allows visual embeddings, keep an image chunk
+        if self.embedding_strategy != 'minilm':
+            img_chunk = DocumentChunk(
+                id=self._generate_doc_id(filepath, 0),
+                source_file=os.path.basename(filepath),
+                content=f"Image: {os.path.basename(filepath)}",
+                modality='image',
+                metadata=metadata
+            )
+            img_chunk.metadata['image_path'] = filepath
+            img_chunk.metadata['file_path'] = filepath
+            chunks.append(img_chunk)
 
         # If OCR text exists, also add a text chunk so lexical/semantic text search finds it
         if ocr_text and ocr_text.strip():
@@ -587,14 +632,17 @@ class MultimodalRAGSystem:
         """Add document chunk to vector database"""
         # Generate appropriate embedding based on modality
         if chunk.modality == 'image':
-            # Always try to use CLIP for images so visual search works
-            if 'image_path' in chunk.metadata and self.clip_model is not None:
-                chunk.embedding = self.embed_image(chunk.metadata['image_path']).tolist()
-            elif self.clip_model is not None:
-                chunk.embedding = self.embed_text_with_clip(chunk.content).tolist()
-            else:
-                # Fallback to text embedding if CLIP is completely unavailable
+            # In MiniLM-only mode, index image as text (OCR or filename)
+            if self.embedding_strategy == 'minilm':
                 chunk.embedding = self.embed_text(chunk.content).tolist()
+                # mark metadata to indicate converted image->text
+                chunk.metadata = dict(chunk.metadata)
+                chunk.metadata['converted_from_image'] = True
+            else:
+                if 'image_path' in chunk.metadata and self.clip_model is not None:
+                    chunk.embedding = self.embed_image(chunk.metadata['image_path']).tolist()
+                else:
+                    chunk.embedding = self.embed_text_with_clip(chunk.content).tolist()
         else:
             chunk.embedding = self.embed_text(chunk.content).tolist()
 
@@ -605,35 +653,21 @@ class MultimodalRAGSystem:
             emb = emb / norm
         chunk.embedding = emb.tolist()
 
-        # Determine Oracle table
-        table = self._ORACLE_TABLES.get(chunk.modality, self._ORACLE_TABLES['text'])
+        # Store chunk in ChromaDB
 
-        # Sanitise metadata and serialise as JSON for CLOB storage
-        safe_meta = self._sanitize_metadata(chunk.metadata)
-        meta_json = _json.dumps(safe_meta)
+        safe_metadata = self._chroma_metadata(chunk)
 
-        # Convert embedding list to array.array for the VECTOR column
-        emb_arr = _array.array('f', chunk.embedding)
+        collection = self._collections.get(
+            chunk.modality,
+            self._collections["text"]
+        )
 
-        # Upsert into Oracle (INSERT … ON CONFLICT / MERGE)
-        upsert_sql = f"""
-            MERGE INTO {table} t
-            USING (SELECT :id AS id FROM dual) s
-            ON (t.id = s.id)
-            WHEN NOT MATCHED THEN
-                INSERT (id, source_file, content, metadata, embedding)
-                VALUES (:id, :src, :content, :meta, :emb)
-            WHEN MATCHED THEN
-                UPDATE SET source_file = :src,
-                           content     = :content,
-                           metadata    = :meta,
-                           embedding   = :emb
-        """
-        with self._oracle_pool.acquire() as con:
-            cur = con.cursor()
-            cur.execute(upsert_sql, id=chunk.id, src=chunk.source_file,
-                        content=chunk.content, meta=meta_json, emb=emb_arr)
-            con.commit()
+        collection.upsert(
+            ids=[chunk.id],
+            embeddings=[chunk.embedding],
+            documents=[chunk.content],
+            metadatas=[safe_metadata],
+        )
 
         # Store in cache
         self.documents[chunk.id] = chunk
@@ -712,73 +746,95 @@ class MultimodalRAGSystem:
     
     # ==================== CROSS-MODAL SEARCH ====================
 
-    def search_by_image(self, image_path: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search_by_image(
+        self,
+        image_path: str,
+        top_k: int = 5
+    ) -> List[Dict[str, Any]]:
+
         """
-        Search across ALL collections using an image query.
-        Uses CLIP image embeddings to find relevant content.
+        Search all ChromaDB collections using an image query.
         """
-        # Generate image embedding
-        query_embedding = self.embed_image(image_path)
-        
-        # Search all Oracle tables
+
+        query_embedding = self.embed_image(
+            image_path
+        ).tolist()
+
         results = []
+
         initial_n = max(20, top_k)
 
-        q_arr = _array.array('f', query_embedding.tolist())
+        for modality, collection in self._collections.items():
 
-        search_sql = (
-            "SELECT id, source_file, content, metadata, "
-            "embedding <-> :q AS dist "
-            "FROM {table} "
-            "ORDER BY dist ASC FETCH FIRST :n ROWS ONLY"
+            count = collection.count()
+
+            if count == 0:
+                continue
+
+            try:
+
+                data = collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=min(initial_n, count),
+                    include=[
+                        "documents",
+                        "metadatas",
+                        "distances"
+                    ],
+                )
+
+                for item_id, document, metadata, distance in zip(
+                    data["ids"][0],
+                    data["documents"][0],
+                    data["metadatas"][0],
+                    data["distances"][0],
+                ):
+
+                    results.append(
+                        self._result_from_chroma(
+                            modality,
+                            item_id,
+                            document,
+                            metadata or {},
+                            distance,
+                        )
+                    )
+
+            except Exception as e:
+
+                print(
+                    f"Error searching ChromaDB "
+                    f"{collection.name}: {e}"
+                )
+
+        # Deduplicate
+
+        best = {}
+
+        for result in results:
+
+            if (
+                result["id"] not in best
+                or result["relevance"]
+                > best[result["id"]]["relevance"]
+            ):
+                best[result["id"]] = result
+
+        results = list(best.values())
+
+        # Filter
+
+        results = [
+            r for r in results
+            if r["relevance"] >= 0.3
+        ]
+
+        results.sort(
+            key=lambda x: x["relevance"],
+            reverse=True
         )
 
-        with self._oracle_pool.acquire() as con:
-            for modality_name, table in self._ORACLE_TABLES.items():
-                try:
-                    cur = con.cursor()
-                    cur.execute(search_sql.format(table=table), q=q_arr, n=initial_n)
-                    rows = cur.fetchall()
-                    for row in rows:
-                        row_id, src, content, meta_json, dist = row
-                        if content and hasattr(content, 'read'):
-                            content = content.read()
-                        if meta_json and hasattr(meta_json, 'read'):
-                            meta_json = meta_json.read()
-
-                        try:
-                            meta = _json.loads(meta_json) if meta_json else {}
-                        except Exception:
-                            meta = {}
-                        result = {
-                            'id': row_id,
-                            'content': content,
-                            'metadata': meta,
-                            'distance': float(dist),
-                            'relevance': max(0.0, 1.0 - float(dist)),
-                            'modality': modality_name
-                        }
-                        results.append(result)
-                except Exception as e:
-                    print(f"Error searching Oracle table {table}: {e}")
-                    continue
-
-        # Sort by relevance
-        results.sort(key=lambda x: x['relevance'], reverse=True)
-        
-        # Deduplicate
-        best = {}
-        for r in results:
-            if r['id'] not in best or r['relevance'] > best[r['id']]['relevance']:
-                best[r['id']] = r
-        
-        final_results = list(best.values())
-        final_results.sort(key=lambda x: x['relevance'], reverse=True)
-        
-        # Filter poor relevance
-        filtered = [r for r in final_results if r['relevance'] >= 0.3]
-        
-        return filtered[:top_k]
+        return results[:top_k]
 
     def search_by_audio(self, audio_path: str, top_k: int = 5) -> Tuple[List[Dict[str, Any]], str]:
         """
@@ -817,62 +873,90 @@ class MultimodalRAGSystem:
             cross_modal: Whether to use CLIP for cross-modal search
         """
         results = []
-        
-        # Generate query embedding using text model (stable semantic space)
-        query_embedding = self.embed_text(query)
 
-        # Determine which Oracle tables to search
+        # Generate query embedding
+        query_embedding = self.embed_text(
+            query
+        ).tolist()
+
+        # Select collections
         if modality:
-            tables = [self._ORACLE_TABLES.get(modality, self._ORACLE_TABLES['text'])]
-        else:
-            tables = list(self._ORACLE_TABLES.values())
 
-        # Retrieve a larger initial set for reranking
+            collection = self._collections.get(
+                modality
+            )
+
+            selected_collections = [
+                (modality, collection)
+            ]
+
+        else:
+
+            selected_collections = list(
+                self._collections.items()
+            )
+
         initial_n = max(20, top_k)
 
-        q_arr = _array.array('f', query_embedding.tolist())
+        # Search ChromaDB
+        for modality_name, collection in selected_collections:
 
-        search_sql = (
-            "SELECT id, source_file, content, metadata, "
-            "embedding <-> :q AS dist "
-            "FROM {table} "
-            "ORDER BY dist ASC FETCH FIRST :n ROWS ONLY"
-        )
+            if collection is None:
+                continue
 
-        with self._oracle_pool.acquire() as con:
-            for table in tables:
-                try:
-                    cur = con.cursor()
-                    cur.execute(search_sql.format(table=table), q=q_arr, n=initial_n)
-                    rows = cur.fetchall()
-                    for row in rows:
-                        row_id, src, content, meta_json, dist = row
-                        if content and hasattr(content, 'read'):
-                            content = content.read()
-                        if meta_json and hasattr(meta_json, 'read'):
-                            meta_json = meta_json.read()
+            count = collection.count()
 
-                        try:
-                            meta = _json.loads(meta_json) if meta_json else {}
-                        except Exception:
-                            meta = {}
-                        result = {
-                            'id': row_id,
-                            'content': content,
-                            'metadata': meta,
-                            'distance': float(dist),
-                            'relevance': max(0.0, 1.0 - float(dist))
-                        }
-                        results.append(result)
-                except Exception as e:
-                    print(f"Error searching Oracle table {table}: {e}")
-                    continue
+            if count == 0:
+                continue
 
-        # Deduplicate by id keeping best initial relevance
+            try:
+
+                data = collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=min(initial_n, count),
+                    include=[
+                        "documents",
+                        "metadatas",
+                        "distances"
+                    ],
+                )
+
+                for item_id, document, metadata, distance in zip(
+                    data["ids"][0],
+                    data["documents"][0],
+                    data["metadatas"][0],
+                    data["distances"][0],
+                ):
+
+                    results.append(
+                        self._result_from_chroma(
+                            modality_name,
+                            item_id,
+                            document,
+                            metadata or {},
+                            distance,
+                        )
+                    )
+
+            except Exception as e:
+
+                print(
+                    f"Error searching ChromaDB "
+                    f"{collection.name}: {e}"
+                )
+
+        # Deduplicate
+
         best = {}
-        for r in results:
-            if r['id'] not in best or r['relevance'] > best[r['id']]['relevance']:
-                best[r['id']] = r
+
+        for result in results:
+
+            if (
+                result["id"] not in best
+                or result["relevance"]
+                > best[result["id"]]["relevance"]
+            ):
+                best[result["id"]] = result
 
         results = list(best.values())
 
@@ -983,16 +1067,24 @@ class MultimodalRAGSystem:
 
     def _init_llm(self, model_path: str, n_gpu_layers: int = -1, n_ctx: int = 4096):
         """Initialize local GGUF model"""
-        if not model_path or not os.path.exists(model_path):
-            print(f"LLM model path not found: {model_path}")
-            return
+
+        if not model_path or not os.path.isfile(model_path):
+            raise FileNotFoundError(
+                f"GGUF model file not found: {model_path}"
+            )
 
         try:
             from llama_cpp import Llama
             print(f"Loading local LLM from {model_path}...")
-            # Set gpu_layers to 0 if not using GPU, else -1 for all layers
-            gpu_layers = n_gpu_layers if self.device == "cuda" else 0
-            
+            # llama-cpp CUDA support is independent of PyTorch CUDA support.
+            # The UI probes llama_supports_gpu_offload() and passes the chosen mode.
+            gpu_layers = max(0, n_gpu_layers) if n_gpu_layers >= 0 else -1
+            if gpu_layers != 0:
+                from llama_cpp import llama_cpp
+                if not llama_cpp.llama_supports_gpu_offload():
+                    print("llama-cpp CUDA offload requested, but this build has no GPU offload support. Falling back to CPU.")
+                    gpu_layers = 0
+
             self.llm_model = Llama(
                 model_path=model_path,
                 n_gpu_layers=gpu_layers,
@@ -1004,74 +1096,145 @@ class MultimodalRAGSystem:
             print(f"Failed to load local LLM: {e}")
             self.llm_model = None
 
+    def _init_external_llm(self, base_url: str, api_key: str = "lm-studio"):
+        """Connect to an OpenAI-compatible local server such as LM Studio."""
+        import json
+        import urllib.request
+        import urllib.error
+
+        self.llm_base_url = (base_url or "http://localhost:1234/v1").rstrip("/")
+        self.llm_api_key = api_key or "lm-studio"
+
+        try:
+            request = urllib.request.Request(
+                f"{self.llm_base_url}/models",
+                headers={"Authorization": f"Bearer {self.llm_api_key}"},
+                method="GET",
+            )
+            with urllib.request.urlopen(request, timeout=8) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+
+            models = payload.get("data", [])
+            if not models:
+                raise RuntimeError("The server is reachable but returned no loaded models.")
+
+            self.llm_external_model = models[0].get("id")
+            if not self.llm_external_model:
+                raise RuntimeError("The server did not provide a usable model ID.")
+
+            self.llm_client = True  # Connection is handled with the standard library.
+            print(
+                f"Connected to external LLM server: {self.llm_base_url} "
+                f"(model={self.llm_external_model})"
+            )
+        except Exception as e:
+            self.llm_client = None
+            self.llm_external_model = None
+            print(f"Failed to connect to external LLM server: {e}")
+
     def generate_answer(self, query: str, context_chunks: List[Dict[str, Any]]) -> str:
         """
-        Generate answer using retrieved context and local LLM
+        Generate an answer from retrieved context using the selected LLM backend.
         """
-        if not self.llm_model:
-            return "Local LLM not initialized. Please configure the model path in settings."
+        if self.llm_backend == "external" and not self.llm_client:
+            return (
+                "External LLM server is not connected. Start LM Studio (or another "
+                "OpenAI-compatible server), load a model, and check the API URL."
+            )
+        if self.llm_backend == "local" and not self.llm_model:
+            return "Local LLM not initialized. Please configure a valid GGUF model path."
 
-        # Format context with numbered citations
+        # Format context with numbered citations.
         context_parts = []
         for i, chunk in enumerate(context_chunks, 1):
-            meta = chunk['metadata']
+            meta = chunk.get('metadata', {})
             source_info = f"[Source {i}]: {meta.get('source_file', 'Unknown')}"
-            
-            # Add specific location info if available
+
             if 'page' in meta:
                 source_info += f" (Page {meta['page']})"
             elif 'start_ms' in meta:
                 start_sec = meta['start_ms'] / 1000.0
                 end_sec = meta.get('end_ms', 0) / 1000.0
                 source_info += f" ({start_sec:.1f}s - {end_sec:.1f}s)"
-            
-            context_parts.append(f"{source_info}\n{chunk['content']}")
 
-        context_text = "\n\n".join(context_parts)
-        
-        # Updated prompt to enforce citations
-        # Mistral Instruct format: <s>[INST] Instruction [/INST] Model answer</s>
-        prompt = f"""<s>[INST] You are a helpful AI assistant. Answer the user's question based ONLY on the provided context.
-You MUST cite your sources using the format [1], [2], etc. corresponding to the source numbers provided in the context.
-Every statement in your answer should be supported by a citation.
-If the answer is not in the context, say you don't know.
-        
-Context:
-{context_text}
+            context_parts.append(f"{source_info}\\n{chunk.get('content', '')}")
 
-Question: {query} [/INST]"""
-        
+        context_text = "\\n\\n".join(context_parts)
+        system_prompt = (
+            "You are a helpful AI assistant. Answer the user's question based ONLY "
+            "on the provided context. You MUST cite sources using [1], [2], etc. "
+            "Every factual statement should have a citation. If the answer is not "
+            "in the context, say you don't know."
+        )
+        user_prompt = f"Context:\\n{context_text}\\n\\nQuestion: {query}"
+
         try:
+            if self.llm_backend == "external":
+                import json
+                import urllib.request
+
+                payload = {
+                    "model": self.llm_external_model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.7,
+                    "max_tokens": 512,
+                }
+                request = urllib.request.Request(
+                    f"{self.llm_base_url}/chat/completions",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.llm_api_key}",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=120) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                return result["choices"][0]["message"]["content"].strip()
+
+            # Keep the existing llama-cpp GGUF path for CPU and CUDA-enabled builds.
+            prompt = (
+                f"<s>[INST] {system_prompt}\\n\\n{user_prompt} [/INST]"
+            )
             output = self.llm_model(
                 prompt,
                 max_tokens=512,
                 stop=["</s>"],
                 echo=False,
-                temperature=0.7
+                temperature=0.7,
             )
             return output['choices'][0]['text'].strip()
         except Exception as e:
             return f"Error generating answer: {str(e)}"
-    
+
     # ==================== UTILITIES ====================
     
     def get_statistics(self) -> Dict[str, Any]:
-        """Get system statistics from Oracle"""
+        """Get statistics from ChromaDB."""
+
         counts = {}
-        with self._oracle_pool.acquire() as con:
-            for modality, table in self._ORACLE_TABLES.items():
-                try:
-                    cur = con.cursor()
-                    cur.execute(f"SELECT COUNT(*) FROM {table}")
-                    counts[modality] = cur.fetchone()[0]
-                except Exception:
-                    counts[modality] = 0
+        total = 0
+
+        for modality, collection in self._collections.items():
+
+            try:
+                count = collection.count()
+
+            except Exception:
+                count = 0
+
+            counts[modality] = count
+            total += count
+
         return {
-            'total_documents': len(self.documents),
-            'text_chunks':  counts.get('text', 0),
-            'image_chunks': counts.get('image', 0),
-            'audio_chunks': counts.get('audio', 0),
-            'storage_path': str(self.storage_dir)
+            "total_documents": total,
+            "text_chunks": counts.get("text", 0),
+            "image_chunks": counts.get("image", 0),
+            "audio_chunks": counts.get("audio", 0),
+            "storage_path": str(self.storage_dir),
         }
     
     def export_index(self, output_path: str):
@@ -1084,6 +1247,17 @@ Question: {query} [/INST]"""
         
         with open(output_path, 'w') as f:
             json.dump(index_data, f, indent=2)
+
+    def unload_llm(self):
+        """Unload the local GGUF model and release memory."""
+        if self.llm_model is not None:
+            del self.llm_model
+            self.llm_model = None
+
+            import gc
+            gc.collect()
+
+            print("Local LLM unloaded.")
 
 
 def main():

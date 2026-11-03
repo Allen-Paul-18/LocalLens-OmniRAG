@@ -1,0 +1,41 @@
+# Git
+.git
+.gitignore
+
+# Environments
+venv/
+env/
+.venv/
+.env
+.env.*
+
+# Python compilation
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Application cache and storage
+rag_storage/
+temp_uploads/
+
+# Model binaries
+*.bin
+*.gguf
+mistral-7b-instruct-v0.2.Q4_K_M-GGUF/
+mistral_model/
+audio_model/
+
+# Testing
+verify_output.txt
+test_rag/
+rag_test_data/
+demo_documents/
+text_files/
+
+# IDEs
+.idea/
+.vscode/
+
+# Logs
+*.log

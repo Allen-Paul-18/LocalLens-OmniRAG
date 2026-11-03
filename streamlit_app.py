@@ -12,6 +12,7 @@ import json
 
 # Import the RAG system
 from multimodal_rag_system import MultimodalRAGSystem
+from sidebar import render_sidebar
 
 # Page configuration
 st.set_page_config(
@@ -20,6 +21,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+if "use_gpu" not in st.session_state:
+    st.session_state.use_gpu = False
 
 # Custom CSS for better styling
 st.markdown("""
@@ -77,25 +81,57 @@ if 'rag_system' not in st.session_state:
     st.session_state.uploaded_files_list = []
 
 def initialize_system():
-    """Initialize the RAG system"""
-    if not st.session_state.initialized:
-        with st.spinner("🚀 Initializing RAG System... This may take a minute on first run."):
-            try:
-                st.session_state.rag_system = MultimodalRAGSystem(
-                    storage_dir="./rag_storage",
-                    use_gpu=st.session_state.get('use_gpu', False),
-                    llm_path=st.session_state.get('llm_path', None),
-                    oracle_dsn=st.session_state.get('oracle_dsn', None),
-                    oracle_user=st.session_state.get('oracle_user', None),
-                    oracle_password=st.session_state.get('oracle_password', None),
-                )
-                st.session_state.initialized = True
-                st.success("✅ System initialized successfully!")
-                return True
-            except Exception as e:
-                st.error(f"❌ Failed to initialize system: {str(e)}")
-                return False
-    return True
+    """Initialize the RAG system and validate the selected LLM backend."""
+
+    backend = st.session_state.get("llm_backend", "local")
+
+    if backend == "local":
+        llm_path = st.session_state.get("llm_path", "")
+
+        if not llm_path or not os.path.isfile(llm_path):
+            st.error(
+                f"❌ GGUF model not found:\n\n`{llm_path}`\n\n"
+                "Please check the model path."
+            )
+            st.session_state.initialized = False
+            return False
+
+    with st.spinner("🚀 Initializing RAG System..."):
+        try:
+            rag = MultimodalRAGSystem(
+                storage_dir="./rag_storage",
+                use_gpu=st.session_state.get("use_gpu", False),
+                llm_path=st.session_state.get("llm_path"),
+                llm_backend=backend,
+                llm_n_gpu_layers=st.session_state.get(
+                    "llm_n_gpu_layers", 0
+                ),
+                llm_base_url=st.session_state.get(
+                    "llm_base_url", "http://localhost:1234/v1"
+                ),
+                llm_api_key=st.session_state.get(
+                    "llm_api_key", "lm-studio"
+                ),
+            )
+
+            # Verify that the selected LLM actually loaded.
+            if backend == "local" and rag.llm_model is None:
+                raise RuntimeError("GGUF model failed to load.")
+
+            if backend == "external" and rag.llm_client is None:
+                raise RuntimeError("External LLM connection failed.")
+
+            st.session_state.rag_system = rag
+            st.session_state.initialized = True
+
+            st.success("✅ System initialized successfully!")
+            return True
+
+        except Exception as e:
+            st.session_state.rag_system = None
+            st.session_state.initialized = False
+            st.error(f"❌ Initialization failed: {e}")
+            return False
 
 def format_file_size(size_bytes):
     """Format file size in human-readable format"""
@@ -139,123 +175,8 @@ def main():
         <hr style='margin: 1rem 0; border: none; border-top: 2px solid #E5E7EB;'>
     """, unsafe_allow_html=True)
     
-    # Sidebar
-    with st.sidebar:
-        st.image("https://img.icons8.com/fluency/96/000000/search.png", width=80)
-        st.markdown("## ⚙️ System Configuration")
-        
-        # GPU toggle
-        use_gpu = st.checkbox(
-            "Use GPU Acceleration",
-            value=st.session_state.get('use_gpu', False),
-            help="Enable GPU for faster processing (requires CUDA)"
-        )
-        st.session_state.use_gpu = use_gpu
+    render_sidebar(initialize_system)
 
-        # Oracle 23ai credentials
-        st.markdown("#### 🗄️ Oracle 23ai Connection")
-        oracle_dsn = st.text_input(
-            "Oracle DSN",
-            value=st.session_state.get('oracle_dsn', os.environ.get('ORACLE_DSN', 'localhost:1521/FREEPDB1')),
-            help="EZConnect string, e.g. host:port/service or a TNS alias"
-        )
-        st.session_state.oracle_dsn = oracle_dsn
-
-        oracle_user = st.text_input(
-            "Oracle User",
-            value=st.session_state.get('oracle_user', os.environ.get('ORACLE_USER', 'rag_user')),
-        )
-        st.session_state.oracle_user = oracle_user
-
-        oracle_password = st.text_input(
-            "Oracle Password",
-            value=st.session_state.get('oracle_password', os.environ.get('ORACLE_PASSWORD', '')),
-            type='password'
-        )
-        st.session_state.oracle_password = oracle_password
-
-        st.markdown("---")
-
-        # Local LLM Path
-        llm_path = st.text_input(
-            "Local LLM Path (GGUF)",
-            value=st.session_state.get('llm_path', "put your model path here(full path is recommended)"),
-            help="Path to the GGUF model file for text generation"
-        )
-        st.session_state.llm_path = llm_path
-        if st.button("🚀 Initialize System", type="primary"):
-            initialize_system()
-        
-        st.markdown("---")
-        
-        # System status
-        if st.session_state.initialized:
-            st.markdown("### 📊 System Status")
-            
-            # Get statistics
-            stats = st.session_state.rag_system.get_statistics()
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Total Docs", stats['total_documents'])
-                st.metric("Text Chunks", stats['text_chunks'])
-            with col2:
-                st.metric("Images", stats['image_chunks'])
-                st.metric("Audio", stats['audio_chunks'])
-            
-            # Status indicator
-            st.markdown("""
-                <div style='background-color: #D1FAE5; padding: 0.5rem; border-radius: 8px; text-align: center; margin-top: 1rem;'>
-                    <span style='color: #065F46; font-weight: 600;'>🟢 System Active</span>
-                </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.warning("⚠️ System not initialized. Click the button above to start.")
-        
-        st.markdown("---")
-        
-        # Supported formats
-        st.markdown("### 📁 Supported Formats")
-        st.markdown("""
-        - 📄 **Documents**: PDF, DOCX, TXT
-        - 🖼️ **Images**: PNG, JPG, JPEG, GIF
-        - 🎵 **Audio**: MP3, WAV, M4A
-        """)
-        
-        st.markdown("---")
-        
-        # Quick actions
-        st.markdown("### ⚡ Quick Actions")
-        
-        if st.button("💣 Delete Database"):
-            if st.session_state.initialized:
-                try:
-                    st.session_state.rag_system.drop_database()
-                    st.session_state.rag_system._init_vector_db()
-                    st.session_state.search_history = []
-                    st.session_state.uploaded_files_list = []
-                    st.success("✅ Database deleted and reset successfully!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"❌ Failed to delete database: {str(e)}")
-            else:
-                st.warning("Please initialize the system first")
-
-        if st.button("📤 Export Index"):
-            if st.session_state.initialized:
-                try:
-                    export_path = f"rag_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-                    st.session_state.rag_system.export_index(export_path)
-                    st.success(f"✅ Index exported to {export_path}")
-                except Exception as e:
-                    st.error(f"❌ Export failed: {str(e)}")
-            else:
-                st.warning("Please initialize the system first")
-        
-        if st.button("🗑️ Clear Cache"):
-            st.cache_data.clear()
-            st.success("✅ Cache cleared")
-    
     # Main content area
     if not st.session_state.initialized:
         # Welcome screen
@@ -780,8 +701,9 @@ def main():
             
             with col1:
                 st.text(f"Storage Path: {stats['storage_path']}")
-                st.text(f"GPU Enabled: {'Yes' if st.session_state.use_gpu else 'No'}")
-            
+                st.text(
+                    f"In-app GPU: {'Enabled' if st.session_state.get('use_gpu', False) else 'Disabled'}"
+                )            
             with col2:
                 st.text(f"Status: ✅ Active")
                 st.text(f"Mode: 🔒 Offline")
